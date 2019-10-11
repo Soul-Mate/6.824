@@ -37,7 +37,7 @@ type config struct {
 	connected []bool   // whether each server is on the net
 	saved     []*Persister
 	endnames  [][]string    // the port file names each sends to
-	logs      []map[int]int // copy of each server's committed entries
+	logs      []map[int]int // copy of each server's committed Entries
 }
 
 var ncpu_once sync.Once
@@ -171,7 +171,7 @@ func (cfg *config) start1(i int) {
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
 				}
 			} else {
-				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
+				err_msg = fmt.Sprintf("committed Command %v is not an int", m.Command)
 			}
 
 			if err_msg != "" {
@@ -279,7 +279,7 @@ func (cfg *config) checkOneLeader() int {
 		lastTermWithLeader := -1
 		for t, leaders := range leaders {
 			if len(leaders) > 1 {
-				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(leaders))
+				cfg.t.Fatalf("Term %d has %d (>1) leaders", t, len(leaders))
 			}
 			if t > lastTermWithLeader {
 				lastTermWithLeader = t
@@ -289,12 +289,15 @@ func (cfg *config) checkOneLeader() int {
 		if len(leaders) != 0 {
 			return leaders[lastTermWithLeader][0]
 		}
+
+		fmt.Println("leaders: ", len(leaders))
 	}
+
 	cfg.t.Fatalf("expected one leader, got none")
 	return -1
 }
 
-// check that everyone agrees on the term.
+// check that everyone agrees on the Term.
 func (cfg *config) checkTerms() int {
 	term := -1
 	for i := 0; i < cfg.n; i++ {
@@ -303,7 +306,7 @@ func (cfg *config) checkTerms() int {
 			if term == -1 {
 				term = xterm
 			} else if term != xterm {
-				cfg.t.Fatalf("servers disagree on term")
+				cfg.t.Fatalf("servers disagree on Term")
 			}
 		}
 	}
@@ -411,14 +414,14 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 
 		if index != -1 {
 			// somebody claimed to be the leader and to have
-			// submitted our command; wait a while for agreement.
+			// submitted our Command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
-						// and it was the command we submitted.
+						// and it was the Command we submitted.
 						return index
 					}
 				}

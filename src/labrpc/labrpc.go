@@ -50,7 +50,9 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "encoding/gob"
+import (
+	"encoding/gob"
+)
 import "bytes"
 import "reflect"
 import "sync"

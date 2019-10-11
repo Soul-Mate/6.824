@@ -9,6 +9,9 @@ import (
 const (
 	minElectionTimeout = 150
 	maxElectionTimeout = 300
+
+	minBroadcastTimeout = 1
+	maxBroadcastTimeout = 20
 )
 
 type raftTimer struct {
@@ -36,5 +39,11 @@ func (rt raftTimer) C() <-chan time.Time {
 func randElectionMillisecond() time.Duration {
 	rand.Seed(time.Now().UnixNano())
 	n := rand.Intn(maxElectionTimeout-minElectionTimeout+1) + minElectionTimeout
+	return time.Duration(n) * time.Millisecond
+}
+
+func randBroadcastMillisecond() time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	n := rand.Intn(maxBroadcastTimeout-minBroadcastTimeout+1) + minBroadcastTimeout
 	return time.Duration(n) * time.Millisecond
 }
