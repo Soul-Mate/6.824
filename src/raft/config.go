@@ -290,7 +290,6 @@ func (cfg *config) checkOneLeader() int {
 			return leaders[lastTermWithLeader][0]
 		}
 
-		fmt.Println("leaders: ", len(leaders))
 	}
 
 	cfg.t.Fatalf("expected one leader, got none")

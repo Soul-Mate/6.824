@@ -30,3 +30,20 @@ func (rs raftState) load() State {
 func (rs raftState) store(s State) {
 	rs.data.Store(s)
 }
+
+func (rf *Raft) stateTransition(state State) {
+	switch state {
+	case Follower:
+		rf.state.store(state)
+		rf.mu.Lock()
+		rf.votedFor = -1
+		rf.mu.Unlock()
+	case Candidate:
+		rf.state.store(state)
+		rf.mu.Lock()
+		rf.votes = 0
+		rf.mu.Unlock()
+	case Leader:
+		rf.state.store(state)
+	}
+}

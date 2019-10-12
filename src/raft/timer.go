@@ -38,12 +38,12 @@ func (rt raftTimer) C() <-chan time.Time {
 
 func randElectionMillisecond() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	n := rand.Intn(maxElectionTimeout-minElectionTimeout+1) + minElectionTimeout
+	n := rand.Intn(maxElectionTimeout-minElectionTimeout) + minElectionTimeout
 	return time.Duration(n) * time.Millisecond
 }
 
 func randBroadcastMillisecond() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	n := rand.Intn(maxBroadcastTimeout-minBroadcastTimeout+1) + minBroadcastTimeout
+	n := rand.Intn(maxBroadcastTimeout-minBroadcastTimeout) + minBroadcastTimeout
 	return time.Duration(n) * time.Millisecond
 }

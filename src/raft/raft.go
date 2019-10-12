@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
@@ -99,6 +98,44 @@ func (rf *Raft) getCurrentTerm() (term int) {
 	return rf.currentTerm
 }
 
+func (rf *Raft) setCurrentTerm(term int) {
+	rf.mu.Lock()
+	rf.currentTerm = term
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getVotedFor() (votedFor int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.votedFor
+}
+
+func (rf *Raft) setVotedFor(candidateID int) {
+	rf.mu.Lock()
+	rf.votedFor = candidateID
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getVotes() (votes int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.votes
+}
+
+func (rf *Raft) setVotes(n int) (votes int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votes = n
+	return rf.votes
+}
+
+func (rf *Raft) incrVotes() (votes int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votes += 1
+	return rf.votes
+}
+
 func (rf *Raft) getLogTerm(index int) (term int) {
 	if index <= 0 || index > len(rf.logs) {
 		return 0
@@ -170,72 +207,71 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	go func() { rf.voteChan <- true }()
 
 	// 候选人任期小于投票者任期, 拒绝投票
-	currentTerm := rf.getCurrentTerm()
-	if args.Term < currentTerm {
-		reply.Term = currentTerm
+	if args.Term < rf.getCurrentTerm() {
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
+		DPrintf("RequestVote Follower-%d (term = %d) > Candidate-%d (term = %d), 拒绝投票\n",
+			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
 		return
 	}
 
-	if args.Term > currentTerm {
-		rf.mu.Lock()
-		rf.currentTerm = args.Term
-		rf.mu.Unlock()
-		rf.state.store(Follower)
+	// 如果 RPC 的请求或者响应中包含一个 term T 大于 currentTerm，
+	// 则currentTerm赋值为 T，并切换状态为追随者（Follower）（5.1 节）
+	if args.Term > rf.getCurrentTerm() {
+		rf.setCurrentTerm(args.Term)
+		rf.stateTransition(Follower)
+		reply.Term = rf.getCurrentTerm()
+		reply.VoteGranted = true
+		DPrintf("RequestVote Follower-%d (term = %d) < Candidate-%d (term = %d), 同意投票\n",
+			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
+		return
 	}
 
-	/*lock*/
-	rf.mu.Lock()
 	// 投票者没有投过票或者给自己投票
-	if rf.votedFor == -1 || args.CandidateID == rf.votedFor {
-		/*unlock*/
-		rf.mu.Unlock()
+	DPrintf("args.LastLogIndex (%d) >= len(rf.logs) (%d) = %v\n", args.LastLogIndex, len(rf.logs), args.LastLogIndex >= len(rf.logs))
+	if (rf.getVotedFor() == -1 || args.CandidateID == rf.getVotedFor()) && args.LastLogIndex >= len(rf.logs) {
+		// 投票
+		reply.Term = rf.getCurrentTerm()
+		reply.VoteGranted = true
+		// 更新在当前任期内投票给的候选人
+		rf.setVotedFor(args.CandidateID)
+		DPrintf("Follower-%d (term = %d) 投票给了 Candidate-%d (term = %d)\n",
+			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
 
-		logTerm := rf.getLogTerm(rf.lastApplied)
+		return
 		// 存储日志位置的任期号不同
-		if logTerm != args.LastLogTerm {
-			// 投票者的任期号大于候选人任期号, 拒绝投票
-			if logTerm > args.LastLogTerm {
-				reply.Term = currentTerm
-				reply.VoteGranted = false
-				return
-			}
-			fmt.Printf("server-%d 投票给了 server-%d, 投票人: server-%d的任期号: server-%d, 候选人: server-%d的任期号: %d\n",
-				rf.me, args.CandidateID, rf.me, currentTerm, args.CandidateID, args.Term)
-			// 投票
-			reply.Term = currentTerm
-			reply.VoteGranted = true
-			// 更新在当前任期内投票给的候选人
-			rf.mu.Lock()
-			rf.votedFor = args.CandidateID
-			rf.mu.Unlock()
-			return
-		}
+		//if rf.getLogTerm(rf.lastApplied) != args.LastLogTerm {
+		//	// 投票者的任期号大于候选人任期号, 拒绝投票
+		//	//if rf.getLogTerm(rf.lastApplied) > args.LastLogTerm {
+		//	//	reply.Term = rf.getCurrentTerm()
+		//	//	reply.VoteGranted = false
+		//	//	return
+		//	//}
+		//}
 
 		// 存储日志位置的任期号相同
-		if logTerm == args.LastLogTerm {
-			// 投票者的日志长度大于候选人的日志长度, 拒绝投票
-			if rf.lastApplied > args.LastLogIndex {
-				reply.Term = currentTerm
-				reply.VoteGranted = false
-				return
-			}
-
-			fmt.Printf("server-%d 投票给了 server-%d, 投票人: server-%d的任期号: server-%d, 候选人: server-%d的任期号: %d\n",
-				rf.me, args.CandidateID, rf.me, currentTerm, args.CandidateID, args.Term)
-			// 投票
-			reply.Term = currentTerm
-			reply.VoteGranted = true
-			// 更新在当前任期内投票给的候选人
-			rf.mu.Lock()
-			rf.votedFor = args.CandidateID
-			rf.mu.Unlock()
-			return
-		}
+		//if rf.getLogTerm(rf.lastApplied) == args.LastLogTerm {
+		//	// 投票者的日志长度大于候选人的日志长度, 拒绝投票
+		//	if rf.lastApplied > args.LastLogIndex {
+		//		reply.Term = rf.getCurrentTerm()
+		//		reply.VoteGranted = false
+		//		return
+		//	}
+		//
+		//	DPrintf("Follower-%d (term = %d) 投票给了 Candidate-%d (term = %d)\n",
+		//		rf.me,rf.getCurrentTerm(), args.CandidateID, args.Term)
+		//	// 投票
+		//	reply.Term = rf.getCurrentTerm()
+		//	reply.VoteGranted = true
+		//	// 更新在当前任期内投票给的候选人
+		//	rf.setVotedFor(args.CandidateID)
+		//	return
+		//}
+	} else {
+		reply.Term = rf.getCurrentTerm()
+		reply.VoteGranted = false
+		return
 	}
-
-	/*unlock*/
-	rf.mu.Unlock()
 }
 
 //
@@ -272,9 +308,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) broadcastElection() {
-	// 用于统计选票
-	// 初始值为1，是为自己投票
+func (rf *Raft) broadcastRequestVote() {
 	// 向其他服务器发送requestVote RPC
 	for i := range rf.peers {
 		// 如果是自己不需要在投票了
@@ -289,7 +323,7 @@ func (rf *Raft) broadcastElection() {
 			}
 
 			args := &RequestVoteArgs{
-				Term:         rf.currentTerm,
+				Term:         rf.getCurrentTerm(),
 				CandidateID:  rf.me,
 				LastLogIndex: rf.lastApplied,
 				LastLogTerm:  rf.getLogTerm(rf.lastApplied),
@@ -299,20 +333,18 @@ func (rf *Raft) broadcastElection() {
 
 			if rf.sendRequestVote(index, args, reply) {
 				// 回复者的term大于currentT
-				if reply.Term > rf.currentTerm {
-					// 赋值term
-					rf.mu.Lock()
-					rf.currentTerm = reply.Term
-					rf.mu.Unlock()
-
+				if reply.Term > rf.getCurrentTerm() {
+					DPrintf("Leader-%d 变为Follower (reply.Term: %d > term: %d)\n", rf.me, reply.Term, rf.getCurrentTerm())
+					// 更新当前服务器的任期
+					rf.setCurrentTerm(reply.Term)
 					// 切换为follower
-					rf.state.store(Follower)
+					rf.stateTransition(Follower)
 					return
 				}
 
-				rf.mu.Lock()
-				rf.votes += 1
-				rf.mu.Unlock()
+				if reply.VoteGranted == true {
+					rf.incrVotes()
+				}
 			}
 		}(i)
 	}
@@ -334,34 +366,28 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	go func() { rf.heartbeatChan <- true }()
+
 	currentTerm := rf.getCurrentTerm()
+	// 如果 RPC 的请求或者响应中包含一个 term T 大于 currentTerm，
+	// 则currentTerm赋值为 T，并切换状态为追随者（Follower）（5.1 节）
 	if args.Term > currentTerm {
-		rf.mu.Lock()
-		rf.currentTerm = args.Term
-		rf.state.store(Follower)
-		rf.mu.Unlock()
-	}
-
-	// heartbeat rpc
-	if args.Entries == nil || len(args.Entries) == 0 {
-
-		// leader Term < follower Term
-		if args.Term < currentTerm {
-			reply.Success = false
-			reply.Term = currentTerm
-			return
-		}
-
+		DPrintf("Follower-%d 交换term %d -> %d\n", rf.me, currentTerm, args.Term)
+		rf.setCurrentTerm(args.Term)
+		rf.stateTransition(Follower)
 		reply.Success = true
 		reply.Term = currentTerm
-
-		// candidate 收到了leader发送的heartbeat，且任期号比自己大
-		// candidate 承认leader的合法状态，自己退回follower
-		if rf.state.load() == Candidate {
-			rf.state.store(Follower)
-		}
 		return
 	}
+
+	// leader Term < follower Term m,
+	if args.Term < currentTerm {
+		reply.Success = false
+		reply.Term = currentTerm
+		return
+	}
+
+	reply.Success = true
+	reply.Term = currentTerm
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -372,6 +398,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) broadcastHeartbeat() {
 	// leader 向其他服务器发送 heartbeat RPC
 	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
 		go func(index int) {
 			args := &AppendEntriesArgs{
 				Term: rf.getCurrentTerm(),
@@ -383,14 +412,14 @@ func (rf *Raft) broadcastHeartbeat() {
 				// 回复者的term大于currentT
 				if reply.Term > rf.getCurrentTerm() {
 					// 赋值term
-					rf.mu.Lock()
-					rf.currentTerm = reply.Term
-					rf.mu.Unlock()
+					rf.setCurrentTerm(reply.Term)
 
 					// 切换为follower
-					rf.state.store(Follower)
+					rf.stateTransition(Follower)
 					return
 				}
+			} else {
+				DPrintf("Leader-%d 发送给 Server-%d heartbeat rpc 失败\n", rf.me, index)
 			}
 		}(i)
 	}
@@ -433,9 +462,15 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	// 递增当前任期
 	rf.currentTerm += 1
-	// 投票给的候选人置空
-	rf.votedFor = -1
+	// 给自己投票
+	rf.votes = 1
 	rf.mu.Unlock()
+
+	// 重置选举计时器
+	rf.timer.reset()
+
+	// 发起选举请求，收集选票
+	rf.broadcastRequestVote()
 }
 
 //
@@ -468,37 +503,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go func() {
 		rf.timer = newRaftTimer()
-
+	L:
 		for {
 			switch rf.state.load() {
 			case Follower: // 跟随者状态
 				select {
 				case <-rf.timer.C(): // 计时器到期
 					// 转变状态为候选人
-					rf.state.store(Candidate)
-					// 开始选举
-					rf.startElection()
-					fmt.Printf("server-%d 开始选举\n", rf.me)
+					rf.stateTransition(Candidate)
+					DPrintf("server-%d 开始选举\n", rf.me)
 					break
 				case <-rf.voteChan: // 收到candidate投票rpc
-					fmt.Printf("server-%d 收到投票rpc, 重置选举计时器\n", rf.me)
+					//DPrintf("server-%d 收到投票rpc, 重置选举计时器\n", rf.me)
 					rf.timer.reset()
 					break
 				case <-rf.heartbeatChan: // 收到leader心跳rpc
-					fmt.Printf("server-%d 收到心跳rpc, 重置选举计时器\n", rf.me)
+					//DPrintf("server-%d 收到心跳rpc, 重置选举计时器\n", rf.me)
 					rf.timer.reset()
 					break
 				default:
 				}
 
 			case Candidate: // 候选人状态
-				rf.mu.Lock()
-				rf.votes += 1
-				rf.mu.Unlock()
-				// 重置选举计时器
-				rf.timer.reset()
-				// 发起选举，收集选票
-				rf.broadcastElection()
+				// 开始选举
+				rf.startElection()
+
 				done := false
 				for {
 					// 如果在交换term的时候或者选举过程中收到leader的heartbeat，从而变为follower, 则不再进行选举
@@ -509,20 +538,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					select {
 					case <-rf.timer.C(): //选举超时
 						// 重新开始新一轮选举
-						rf.timer.reset()
 						rf.startElection()
-						// 重置上一轮选举获得的选票
-						rf.mu.Lock()
-						rf.votes = 0
-						rf.mu.Unlock()
-						rf.broadcastElection()
 					default: // 不断统计选票, 直到超过半数
 						rf.mu.Lock()
-						if rf.votes > len(rf.peers) {
-							fmt.Printf("server-%d 成为leader, 获得选票(votes): %d\n", rf.me, rf.votes)
+						if rf.votes > len(rf.peers)/2 {
+							DPrintf("server-%d 成为leader, 获得选票(votes): %d (term = %d)\n", rf.me, rf.votes, rf.currentTerm)
 							rf.mu.Unlock()
 							// 选举成为leader
 							rf.state.store(Leader)
+
 							done = true
 							break
 						}
@@ -535,17 +559,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 
 			case Leader:
-				randBroadcastMillisecond()
-				fmt.Printf("Leader: %d 广播headerbeat rpc\n", rf.me)
-				// 发送heartbeat
-				rf.broadcastHeartbeat()
 				for {
 					if rf.state.load() == Follower {
-						break
+						DPrintf("%d Leader -> Follower goto loop\n", rf.me)
+						goto L
 					}
-					<-time.Tick(randBroadcastMillisecond())
-					fmt.Printf("Leader: %d 广播headerbeat rpc\n", rf.me)
+
+					// 发送heartbeat
+					DPrintf("Leader-%d 广播heartbeat rpc (term = %d)\n", rf.me, rf.getCurrentTerm())
 					rf.broadcastHeartbeat()
+					time.Sleep(time.Duration(100) * time.Millisecond)
 				}
 			}
 		}
