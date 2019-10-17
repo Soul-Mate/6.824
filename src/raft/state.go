@@ -35,15 +35,19 @@ func (rf *Raft) stateTransition(state State) {
 	switch state {
 	case Follower:
 		rf.state.store(state)
-		rf.mu.Lock()
-		rf.votedFor = -1
-		rf.mu.Unlock()
+		rf.setVotes(-1)
 	case Candidate:
 		rf.state.store(state)
-		rf.mu.Lock()
-		rf.votes = 0
-		rf.mu.Unlock()
+		rf.setVotes(0)
 	case Leader:
 		rf.state.store(state)
+
+		// each follower
+		rf.mu.Lock()
+		for peerIndex := range rf.peers {
+			rf.leaderState.nextIndex[peerIndex] = int(rf.lastLogIndex + 1)
+			rf.leaderState.machIndex[peerIndex] = 0
+		}
+		rf.mu.Unlock()
 	}
 }

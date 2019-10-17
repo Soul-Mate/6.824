@@ -19,6 +19,7 @@ package raft
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "labrpc"
@@ -43,6 +44,11 @@ type Log struct {
 	Command interface{}
 }
 
+type LeaderState struct {
+	nextIndex map[int]int
+	machIndex map[int]int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,24 +61,20 @@ type Raft struct {
 	state raftState
 	timer raftTimer
 
-	currentTerm int
-	votedFor    int
-	logs        []Log
-	commitIndex int
-	lastApplied int
-
-	votes         int
-	voteChan      chan bool
-	heartbeatChan chan bool
-
+	currentTerm     uint32
+	votedFor        int32
+	logs            []Log
+	commitIndex     uint32
+	lastApplied     uint32
+	votes           int32
+	voteChan        chan bool
+	heartbeatChan   chan bool
+	leaderState     LeaderState
+	lastLogIndex    int32
+	replicaLogCount int32
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-}
-
-type LeaderPeer struct {
-	nextIndex int
-	machIndex int
 }
 
 // return currentTerm and whether this server
@@ -93,57 +95,85 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) getCurrentTerm() (term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm
+	return int(atomic.LoadUint32(&rf.currentTerm))
 }
 
 func (rf *Raft) setCurrentTerm(term int) {
-	rf.mu.Lock()
-	rf.currentTerm = term
-	rf.mu.Unlock()
+	atomic.StoreUint32(&rf.currentTerm, uint32(term))
+}
+
+func (rf *Raft) incrCurrentTerm() {
+	atomic.AddUint32(&rf.currentTerm, 1)
 }
 
 func (rf *Raft) getVotedFor() (votedFor int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.votedFor
+	return int(atomic.LoadInt32(&rf.votedFor))
 }
 
 func (rf *Raft) setVotedFor(candidateID int) {
-	rf.mu.Lock()
-	rf.votedFor = candidateID
-	rf.mu.Unlock()
+	atomic.StoreInt32(&rf.votedFor, int32(candidateID))
 }
 
 func (rf *Raft) getVotes() (votes int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.votes
+	return int(atomic.LoadInt32(&rf.votes))
 }
 
-func (rf *Raft) setVotes(n int) (votes int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.votes = n
-	return rf.votes
+func (rf *Raft) setVotes(n int) {
+	atomic.StoreInt32(&rf.votes, int32(n))
 }
 
-func (rf *Raft) incrVotes() (votes int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.votes += 1
-	return rf.votes
+func (rf *Raft) incrVotes() {
+	atomic.AddInt32(&rf.votes, 1)
 }
 
-func (rf *Raft) getLogTerm(index int) (term int) {
+func (rf *Raft) getLastApplied() (lastApplied int) {
+	return int(atomic.LoadUint32(&rf.lastApplied))
+}
+
+func (rf *Raft) getLastLogTerm() (term int) {
+	index := rf.getLastApplied()
 	if index <= 0 || index > len(rf.logs) {
 		return 0
 	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.logs[index].Term
+}
+
+func (rf *Raft) getPrevLogIndex() (prevLogIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if len(rf.logs) == 0 {
+		return -1
+	}
+
+	return int(rf.lastLogIndex - 1)
+}
+
+func (rf *Raft) getPrevLogTerm() (prevLogIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if len(rf.logs) == 0 {
+		return -1
+	}
+
+	return rf.logs[rf.lastLogIndex-1].Term
+}
+
+func (rf *Raft) getSendLogEntries(peer int) (entries []Log) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	nextIndex, ok := rf.leaderState.nextIndex[peer]
+	if ok {
+		entries = make([]Log, nextIndex)
+		copy(entries, rf.logs)
+	}
+
+	return
+}
+
+func (rf *Raft) getLeaderCommit() (committed int) {
+	return int(atomic.LoadUint32(&rf.commitIndex))
 }
 
 //
@@ -204,74 +234,88 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	go func() { rf.voteChan <- true }()
+	// go func() { rf.voteChan <- true }()
 
 	// 候选人任期小于投票者任期, 拒绝投票
 	if args.Term < rf.getCurrentTerm() {
+		DPrintf("Follower-%d refused to vote for Candidate-%d (Follower term: %d > Candidate term: %d), \n",
+			rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term)
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
-		DPrintf("RequestVote Follower-%d (term = %d) > Candidate-%d (term = %d), 拒绝投票\n",
-			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
+
 		return
 	}
 
 	// 如果 RPC 的请求或者响应中包含一个 term T 大于 currentTerm，
 	// 则currentTerm赋值为 T，并切换状态为追随者（Follower）（5.1 节）
+	// 同意投票请求
 	if args.Term > rf.getCurrentTerm() {
+		// 重置选举计时器
+		go func() { rf.voteChan <- true }()
+		DPrintf("Follower-%d vote for Candidate-%d (Follower term: %d < Candidate term: %d), \n",
+			rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term)
 		rf.setCurrentTerm(args.Term)
 		rf.stateTransition(Follower)
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = true
-		DPrintf("RequestVote Follower-%d (term = %d) < Candidate-%d (term = %d), 同意投票\n",
-			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
 		return
 	}
 
+	// 候选人与投票人任期号相等
 	// 投票者没有投过票或者给自己投票
-	DPrintf("args.LastLogIndex (%d) >= len(rf.logs) (%d) = %v\n", args.LastLogIndex, len(rf.logs), args.LastLogIndex >= len(rf.logs))
-	if (rf.getVotedFor() == -1 || args.CandidateID == rf.getVotedFor()) && args.LastLogIndex >= len(rf.logs) {
-		// 投票
+	if rf.getVotedFor() == -1 || args.CandidateID == rf.getVotedFor() {
+		// 选举限制 （5.4）
+		// candidate日志至少和过半服务器节点一样新
+		// 通过比较最后一条日志条目的索引号和任期号来判断谁更新
+
+		// 如果两份日志（候选人和投票人各自存储的日志条目）任期号不同，那么任期号大的更新
+		if rf.getLastLogTerm() != args.LastLogTerm {
+			// 投票人的最后一条日志条目的任期号大于候选人最新日志的任期号, 拒绝投票
+			if rf.getLastLogTerm() > args.LastLogTerm {
+				DPrintf("Follower-%d refused to vote for Candidate-%d (Follower term: %d == Candidate term: %d, Follower LastLogTerm: %d > Candidate LastLogTerm: %d), \n",
+					rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term, rf.getLastLogTerm(), args.LastLogTerm)
+				reply.Term = rf.getCurrentTerm()
+				reply.VoteGranted = false
+				return
+			}
+
+			// 重置选举计时器
+			go func() { rf.voteChan <- true }()
+			// 同意投票
+			DPrintf("Follower-%d vote for Candidate-%d (Follower term: %d == Candidate term: %d, Follower LastLogTerm: %d < Candidate LastLogTerm: %d), \n",
+				rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term, rf.getLastLogTerm(), args.LastLogTerm)
+			reply.Term = rf.getCurrentTerm()
+			reply.VoteGranted = true
+			rf.setVotedFor(args.CandidateID)
+			return
+		}
+
+		// 存储日志位置的任期号相同，比较日志长度（应用到状态机的日志索引，非commited index），长度大的日志较新
+		// 投票人的日志长度大于候选人
+		if rf.getLastApplied() > args.LastLogIndex {
+			DPrintf("Follower-%d refused to vote for Candidate-%d (Follower term: %d == Candidate term: %d, Follower Apply Log Length: %d > Candidate Apply Log Length: %d), \n",
+				rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term, rf.getLastApplied(), args.LastLogIndex)
+			reply.Term = rf.getCurrentTerm()
+			reply.VoteGranted = false
+			return
+		}
+
+		// 重置选举计时器
+		go func() { rf.voteChan <- true }()
+		// 同意投票
+		DPrintf("Follower-%d vote for Candidate-%d (Follower term: %d == Candidate term: %d, Follower Apply Log Length: %d <= Candidate Apply Log Length: %d), \n",
+			rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term, rf.getLastApplied(), args.LastLogIndex)
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = true
-		// 更新在当前任期内投票给的候选人
 		rf.setVotedFor(args.CandidateID)
-		DPrintf("Follower-%d (term = %d) 投票给了 Candidate-%d (term = %d)\n",
-			rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
-
-		return
-		// 存储日志位置的任期号不同
-		//if rf.getLogTerm(rf.lastApplied) != args.LastLogTerm {
-		//	// 投票者的任期号大于候选人任期号, 拒绝投票
-		//	//if rf.getLogTerm(rf.lastApplied) > args.LastLogTerm {
-		//	//	reply.Term = rf.getCurrentTerm()
-		//	//	reply.VoteGranted = false
-		//	//	return
-		//	//}
-		//}
-
-		// 存储日志位置的任期号相同
-		//if rf.getLogTerm(rf.lastApplied) == args.LastLogTerm {
-		//	// 投票者的日志长度大于候选人的日志长度, 拒绝投票
-		//	if rf.lastApplied > args.LastLogIndex {
-		//		reply.Term = rf.getCurrentTerm()
-		//		reply.VoteGranted = false
-		//		return
-		//	}
-		//
-		//	DPrintf("Follower-%d (term = %d) 投票给了 Candidate-%d (term = %d)\n",
-		//		rf.me,rf.getCurrentTerm(), args.CandidateID, args.Term)
-		//	// 投票
-		//	reply.Term = rf.getCurrentTerm()
-		//	reply.VoteGranted = true
-		//	// 更新在当前任期内投票给的候选人
-		//	rf.setVotedFor(args.CandidateID)
-		//	return
-		//}
-	} else {
-		reply.Term = rf.getCurrentTerm()
-		reply.VoteGranted = false
-		return
 	}
+
+	DPrintf("Follower-%d (term: %d) alreay voted Candidate-%d, Refused to vote for Candidate-%d (term: %d), \n",
+		rf.me, rf.getCurrentTerm(), rf.getVotedFor(), args.CandidateID, args.Term)
+	// 投票人投过票了，拒绝再次投票
+	reply.Term = rf.getCurrentTerm()
+	reply.VoteGranted = false
+	return
 }
 
 //
@@ -317,7 +361,7 @@ func (rf *Raft) broadcastRequestVote() {
 		}
 
 		go func(index int) {
-			// follower状态不用统计
+			// 当前candidate在发起收集选票的过程中如果变为了candidate则不需要在进行选票收集了
 			if rf.state.load() == Follower {
 				return
 			}
@@ -325,8 +369,8 @@ func (rf *Raft) broadcastRequestVote() {
 			args := &RequestVoteArgs{
 				Term:         rf.getCurrentTerm(),
 				CandidateID:  rf.me,
-				LastLogIndex: rf.lastApplied,
-				LastLogTerm:  rf.getLogTerm(rf.lastApplied),
+				LastLogIndex: rf.getLastApplied(),
+				LastLogTerm:  rf.getLastLogTerm(),
 			}
 
 			reply := &RequestVoteReply{}
@@ -334,7 +378,7 @@ func (rf *Raft) broadcastRequestVote() {
 			if rf.sendRequestVote(index, args, reply) {
 				// 回复者的term大于currentT
 				if reply.Term > rf.getCurrentTerm() {
-					DPrintf("Leader-%d 变为Follower (reply.Term: %d > term: %d)\n", rf.me, reply.Term, rf.getCurrentTerm())
+					DPrintf("Candidate-%d (term = %d) -> Follower (term = %d)\n", rf.me, reply.Term, rf.getCurrentTerm())
 					// 更新当前服务器的任期
 					rf.setCurrentTerm(reply.Term)
 					// 切换为follower
@@ -395,6 +439,51 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) broadcastAppendEntries() {
+	for peerIndex := range rf.peers {
+		if peerIndex == rf.me {
+			continue
+		}
+
+		go func(peer int) {
+			args := &AppendEntriesArgs{
+				Term:         rf.getCurrentTerm(),
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.getPrevLogIndex(),
+				PrevLogTerm:  rf.getPrevLogTerm(),
+				Entries:      rf.getSendLogEntries(peer),
+				LeaderCommit: rf.getLeaderCommit(),
+			}
+			reply := &AppendEntriesReply{}
+			for {
+				if rf.sendAppendEntries(peer, args, reply) {
+					if reply.Term > rf.getCurrentTerm() {
+						rf.state.stateTransition(Follower)
+						rf.setCurrentTerm(reply.Term)
+						return
+					}
+
+					if reply.Success {
+						// 更新follower nextIndex 和 machIndex
+						rf.mu.Lock()
+						rf.leaderState.nextIndex[peer] = rf.leaderState.nextIndex[peer] + 1
+						rf.leaderState.machIndex[peer] = rf.leaderState.nextIndex[peer]
+						rf.mu.Unlock()
+
+						// 统计追加日志成功数
+						atomic.AddInt32(&rf.replicaLogCount, 1)
+					} else {
+
+					}
+
+					return
+				}
+			}
+
+		}(peerIndex)
+	}
+}
+
 func (rf *Raft) broadcastHeartbeat() {
 	// leader 向其他服务器发送 heartbeat RPC
 	for i := range rf.peers {
@@ -444,6 +533,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	if rf.state.load() != Leader {
+		isLeader = false
+		return index, term, isLeader
+	}
+
+	// 追加命令到日志中
+	rf.mu.Lock()
+	rf.logs = append(rf.logs, Log{
+		Command: command,
+		Term:    rf.getCurrentTerm(),
+	})
+	rf.lastLogIndex += 1
+	rf.mu.Unlock()
+
+	// 发起RPC
 
 	return index, term, isLeader
 }
@@ -459,12 +563,11 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) startElection() {
-	rf.mu.Lock()
 	// 递增当前任期
-	rf.currentTerm += 1
+	rf.incrCurrentTerm()
+
 	// 给自己投票
-	rf.votes = 1
-	rf.mu.Unlock()
+	rf.setVotes(1)
 
 	// 重置选举计时器
 	rf.timer.reset()
@@ -494,10 +597,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = newRaftState()
 	rf.state.store(Follower)
-	rf.currentTerm = 0
-	rf.votedFor = -1 // nil
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+
+	// 初始化currentTerm
+	atomic.StoreUint32(&rf.currentTerm, 0)
+
+	// 初始化votedFor (用-1表示nil)
+	atomic.StoreInt32(&rf.votedFor, -1)
+
+	// 初始化votes
+	atomic.StoreInt32(&rf.votes, 0)
+
+	// 初始化commitIndex
+	atomic.StoreUint32(&rf.commitIndex, 0)
+
+	// 初始化lastApplied
+	atomic.StoreUint32(&rf.lastApplied, 0)
+
+	// 初始化logs
+	rf.logs = make([]Log, 0, 0)
+
+	rf.lastLogIndex = 0
+
 	rf.voteChan = make(chan bool)
 	rf.heartbeatChan = make(chan bool)
 
@@ -511,7 +631,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				case <-rf.timer.C(): // 计时器到期
 					// 转变状态为候选人
 					rf.stateTransition(Candidate)
-					DPrintf("server-%d 开始选举\n", rf.me)
+					DPrintf("Follower-%d (term = %d) -> Candidate, start election\n", rf.me, rf.getCurrentTerm())
 					break
 				case <-rf.voteChan: // 收到candidate投票rpc
 					//DPrintf("server-%d 收到投票rpc, 重置选举计时器\n", rf.me)
@@ -537,20 +657,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					select {
 					case <-rf.timer.C(): //选举超时
+						DPrintf("Candidate-%d (term = %d) election timeout restart election\n", rf.me, rf.getCurrentTerm())
 						// 重新开始新一轮选举
 						rf.startElection()
+
 					default: // 不断统计选票, 直到超过半数
-						rf.mu.Lock()
-						if rf.votes > len(rf.peers)/2 {
-							DPrintf("server-%d 成为leader, 获得选票(votes): %d (term = %d)\n", rf.me, rf.votes, rf.currentTerm)
-							rf.mu.Unlock()
+						if rf.getVotes() > len(rf.peers)/2 {
+							DPrintf("Candidate-%d (term = %d) -> Leader get votes = %d\n", rf.me, rf.getCurrentTerm(), rf.getVotes())
 							// 选举成为leader
 							rf.state.store(Leader)
 
 							done = true
 							break
 						}
-						rf.mu.Unlock()
 					}
 
 					if done {
@@ -560,15 +679,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 			case Leader:
 				for {
+					// Leader在和其他server通信的过程中发现自己term落后，遂变成follower
+					// 此时Leader不需要在发送heartbeat
 					if rf.state.load() == Follower {
-						DPrintf("%d Leader -> Follower goto loop\n", rf.me)
+						DPrintf("Leader-%d (term = %d) -> Follower\n", rf.me, rf.getCurrentTerm())
 						goto L
 					}
 
 					// 发送heartbeat
-					DPrintf("Leader-%d 广播heartbeat rpc (term = %d)\n", rf.me, rf.getCurrentTerm())
+					DPrintf("Leader-%d (term = %d) broadcast heartbeat rpc\n", rf.me, rf.getCurrentTerm())
 					rf.broadcastHeartbeat()
-					time.Sleep(time.Duration(100) * time.Millisecond)
+					time.Sleep(time.Duration(5) * time.Millisecond)
 				}
 			}
 		}

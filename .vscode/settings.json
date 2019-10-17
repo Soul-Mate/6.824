@@ -1,0 +1,8 @@
+{
+    "editor.fontLigatures": true,
+    "editor.fontSize": 16,
+    "workbench.colorTheme": "Material Theme",
+    "go.toolsGopath": "D:\\workspace\\code\\go\\bin",
+    "go.inferGopath": true,
+    "go.testFlags": ["-race", "-v", "-count=1"],
+}
