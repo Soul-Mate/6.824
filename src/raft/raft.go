@@ -140,35 +140,43 @@ func (rf *Raft) getLastLogTerm() (term int) {
 	return rf.logs[index].Term
 }
 
+// getPrevLogIndex 获取Leader前一个日志条目的索引位置
 func (rf *Raft) getPrevLogIndex() (prevLogIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if len(rf.logs) == 0 {
+	if len(rf.logs) == 0 || rf.lastLogIndex == 0 {
 		return -1
 	}
 
 	return int(rf.lastLogIndex - 1)
 }
 
+// getPrevLogTerm 获取Leader前一个日志索引处的任期号
 func (rf *Raft) getPrevLogTerm() (prevLogIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if len(rf.logs) == 0 {
+	// 日志为空 任期号返回-1表示为空
+	if len(rf.logs) == 0 || rf.lastLogIndex == 0 {
 		return -1
 	}
 
 	return rf.logs[rf.lastLogIndex-1].Term
 }
 
+// getSendLogEntries 获取AppendEntries RPC要发送的日志条目
+// 每个raft peer都有自己需要发送的条目，由leader维护
 func (rf *Raft) getSendLogEntries(peer int) (entries []Log) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 找不到raft peer 或者当前leader日志为空的时候不需要复制日志
+	// 发送空的AppendEntries RPC
 	nextIndex, ok := rf.leaderState.nextIndex[peer]
-	if ok {
-		entries = make([]Log, nextIndex)
-		copy(entries, rf.logs)
+	if !ok || nextIndex == -1 {
+		return
 	}
 
+	entries = make([]Log, nextIndex)
+	copy(entries, rf.logs)
 	return
 }
 
@@ -454,11 +462,13 @@ func (rf *Raft) broadcastAppendEntries() {
 				Entries:      rf.getSendLogEntries(peer),
 				LeaderCommit: rf.getLeaderCommit(),
 			}
+
 			reply := &AppendEntriesReply{}
+
 			for {
 				if rf.sendAppendEntries(peer, args, reply) {
 					if reply.Term > rf.getCurrentTerm() {
-						rf.state.stateTransition(Follower)
+						rf.stateTransition(Follower)
 						rf.setCurrentTerm(reply.Term)
 						return
 					}
@@ -548,7 +558,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 
 	// 发起RPC
-
+	rf.broadcastAppendEntries()
 	return index, term, isLeader
 }
 

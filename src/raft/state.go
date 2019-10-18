@@ -45,8 +45,13 @@ func (rf *Raft) stateTransition(state State) {
 		// each follower
 		rf.mu.Lock()
 		for peerIndex := range rf.peers {
-			rf.leaderState.nextIndex[peerIndex] = int(rf.lastLogIndex + 1)
-			rf.leaderState.machIndex[peerIndex] = 0
+			if rf.lastLogIndex == 0 {
+				rf.leaderState.nextIndex[peerIndex] = -1
+				rf.leaderState.machIndex[peerIndex] = -1
+			} else {
+				rf.leaderState.nextIndex[peerIndex] = int(rf.lastLogIndex + 1)
+				rf.leaderState.machIndex[peerIndex] = 0
+			}
 		}
 		rf.mu.Unlock()
 	}
