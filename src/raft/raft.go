@@ -65,6 +65,19 @@ func (rs raftState) String(s State) string {
 }
 
 func (rf *Raft) stateTransition(state State) {
+	prevState := rf.state.load()
+
+	// leader上任，通知periodHeartbeat解除condition的wait
+	if prevState == Candidate && state == Leader {
+		rf.leaderTookOfficeCond.Broadcast()
+	}
+
+	// leader下任，通知periodHeartbeat解除condition的wait
+	if prevState == Leader && state == Follower {
+		rf.leaderStepDownCond.Broadcast()
+	}
+
+
 	switch state {
 	case Follower:
 		rf.setVotes(-1)
@@ -97,11 +110,9 @@ func (rf *Raft) stateTransition(state State) {
 		}
 		rf.mu.Unlock()
 
+	
 		// 保存状态
 		rf.state.store(state)
-		
-		// leader上任，通知periodHeartbeat解除condition的wait
-		rf.leaderTookOfficeCond.Broadcast()
 	}
 }
 
@@ -169,6 +180,7 @@ type Raft struct {
 	commitCh               chan bool  // 提交日志channel
 
 	state raftState
+	timer time.Timer
 }
 
 func (rf *Raft) getCurrentTerm() (term int) {
@@ -265,8 +277,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// Check 1. Reply false if term < currentTerm (#5.1)
 	if args.Term < rf.getCurrentTerm() {
-		DPrintf("Follower-%d refused to vote for Candidate-%d (Follower term: %d > Candidate term: %d), \n",
-			rf.me, args.CandidateID, rf.getCurrentTerm(), args.Term)
+		DPrintf("%s-%d (term = %d) refused to vote for Candidate-%d (term = %d)\n",
+			rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
 			
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
@@ -277,8 +289,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// All Servers:
 	//	If RPC request or respose contains term T > currentTerm:
 	//	set currentTerm = T, convert to follower (#5.1)
-
-	// DPrintf("%s-%d Convert to Follower\n", rf.state.String(rf.state.load()), rf.me)
 	rf.setCurrentTerm(args.Term)
 	rf.stateTransition(Follower)
 
@@ -293,6 +303,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.setVotedFor(args.CandidateID)
 			reply.Term = rf.getCurrentTerm()
 			reply.VoteGranted = true
+			// DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d), when lastLogIndex < 0\n",
+			// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
+			
 			return
 		}
 
@@ -304,6 +317,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.setVotedFor(args.CandidateID)
 			reply.Term = rf.getCurrentTerm()
 			reply.VoteGranted = true
+			DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d)\n",
+				rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
 			return
 		}
 	}
@@ -488,29 +503,34 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Rules for Servers
+	// All Servers:
+	// 	If RPC request or response contains term T > currentTerm:
+	// 	set currentTerm = T, convert to follower (#5.1)
+	if args.Term > rf.getCurrentTerm() {
+		rf.setCurrentTerm(args.Term)
+		rf.stateTransition(Follower)
+		// DPrintf("[rf.AppendEntries] %s-%d (term = %d) receive Leader-%d (term = %d) request, convert follower\n", 
+		// rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
+	}
+	
 	// Figure 2.
 	// AppendEntries RPC Receiver implementation
 	// Check 1. Reply false if term < currentTerm (# 5.1)
 	if args.Term < rf.getCurrentTerm() {
 		reply.Success = false
 		reply.Term = rf.getCurrentTerm()
+		// DPrintf("[rf.AppendEntries] %s-%d (term = %d) refused Leader-%d (term = %d) request\n", 
+		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
 		return
 	}
-
-	// Rules for Servers
-	// All Servers:
-	// 	If RPC request or response contains term T > currentTerm:
-	// 	set currentTerm = T, convert to follower (#5.1)
-	rf.setCurrentTerm(args.Term)
-	rf.stateTransition(Follower)
-
+	
 	// TODO heartbeat
 	if len(args.Entries) == 0 && args.PrevLogIndex < 0 {
-		// DPrintf("[AppendEntries Heartbetat] Follower-%d 交换term %d -> %d\n",
-		// 	rf.me, rf.getCurrentTerm(), args.Term)
-
 		rf.resetElectionTimeoutCh <- true
-
+		// DPrintf("%s-%d (term = %d) receive Leader-%d (term = %d) heartbeat\n", 
+		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
+		
 		reply.Success = true
 		reply.Term = rf.getCurrentTerm()
 		return
@@ -654,6 +674,10 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int) {
 					if reply.Term > rf.getCurrentTerm() {
 						rf.setCurrentTerm(reply.Term)
 						rf.stateTransition(Follower)
+						
+						// leader 退任
+						rf.leaderStepDownCond.Broadcast()
+						DPrintf("[rf.broadcastAppendEntries] leader step down\n")
 						return
 					}
 
@@ -809,6 +833,7 @@ func (rf *Raft) startElection() {
 // periodElectionTimeout 周期性的登台follower选举计时器超时
 func (rf *Raft) periodElectionTimeout() {
 	timer := time.NewTimer(randElectionMillisecond())
+L:
 	for {
 		// 在peer是leeader的情况下，不需要选举计时器
 		// 进入condition等待，直到leader退任
@@ -816,19 +841,22 @@ func (rf *Raft) periodElectionTimeout() {
 			rf.mu.Lock()
 			rf.leaderStepDownCond.Wait()
 			rf.mu.Unlock()
-			continue
-		}
+		} else {
+			// 在peer不是leader的情况下
+			// 等待心跳、投票事件，重置选举计时器
+			// 选举计时器，超时要进行选举
+			select {
+			case <-timer.C: // 选举计时器到期, 进行选举
+				if _, isLeader := rf.GetState(); isLeader {
+					goto L
+				}
 
-		// 在peer不是leader的情况下
-		// 等待心跳、投票事件，重置选举计时器
-		// 选举计时器，超时要进行选举
-
-		select {
-		case <-timer.C: // 选举计时器到期, 进行选举
-			// 开始选举
-			rf.startElectionCh <- true
-		case <-rf.resetElectionTimeoutCh: // 收到了leader发送的AppendEntries 或 Candidate投票请求，重置选举计时器
-			timer.Reset(randElectionMillisecond())
+				// 开始选举
+				rf.startElectionCh <- true
+				DPrintf("[rf.periodElectionTimeout] %s-%d\n", rf.state.String(rf.state.load()), rf.me)
+			case <-rf.resetElectionTimeoutCh: // 收到了leader发送的AppendEntries 或 Candidate投票请求，重置选举计时器
+				timer.Reset(randElectionMillisecond())
+			}
 		}
 	}
 }
@@ -884,11 +912,28 @@ func (rf *Raft) commit() {
 
 // loop raft事件循环
 func (rf *Raft) loop() {
+	for {
+		switch rf.state.load() {
+		case Follower:
+			select {
+			case <-rf.startElectionCh:
+				rf.stateTransition(Candidate)
+				break
+			default:
+			}	
+		case Candidate:
+			// 开始选举
+			rf.startElection()
+		case Leader:
+		}
+	}
+
+
 L:
 	for {
 		select {
 		case <-rf.startElectionCh: // 收到选举channel
-			DPrintf("Follower-%d start election...\n", rf.me)
+			DPrintf("%s-%d start election\n", rf.state.String(rf.state.load()), rf.me)
 
 			// 转变状态
 			rf.stateTransition(Candidate)
@@ -920,6 +965,8 @@ L:
 				}
 			}
 		case <-rf.startHeartbeatCh: // 收到心跳发送channel
+			DPrintf("[rf.loop] %s-%d (term = %d) broadcast heartbeat\n", rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
+			
 			rf.broadcastHeartbeat()
 		}
 	}
@@ -1043,7 +1090,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitCh = make(chan bool)
 
 	rf.state = newRaftState()
-	rf.stateTransition(Follower)
+	rf.state.store(Follower)
 
 	// 启动 raft 事件主循环
 	go rf.loop()

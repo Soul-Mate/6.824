@@ -21,8 +21,8 @@ const (
 	minElectionTimeout = 150
 	maxElectionTimeout = 300
 
-	minBroadcastTimeout = 1
-	maxBroadcastTimeout = 20
+	minBroadcastTimeout = 50
+	maxBroadcastTimeout = 100
 )
 
 
