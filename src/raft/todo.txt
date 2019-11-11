@@ -1,0 +1,84 @@
+# 20191111
+
+问题: 状态不同步
+
+日志如下：
+
+Test (2A): election after network failure ...
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:53 [rf.loop] Candidate-2 election timeout, start election... (term = 0)
+2019/11/11 10:08:53 [rf.loop] Candidate-1 election timeout, start election... (term = 0)
+2019/11/11 10:08:53 [rf.loop] Candidate-0 election timeout, start election... (term = 0)
+2019/11/11 10:08:53 [rf.RequestVote] Follower-1 (term = 1) vote to Candidate-2 (term = 1), when lastLogIndex < 0
+2019/11/11 10:08:53 [rf.RequestVote] Follower-0 (term = 1) vote to Candidate-2 (term = 1), when lastLogIndex < 0
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:53 [rf.loop] Candidate-2 (term = 1) convert Leader (votes = 3)
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:53 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:53 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:53 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 [rf.loop] Candidate-0 election timeout, start election... (term = 1)
+2019/11/11 10:08:54 [rf.RequestVote] Follower-1 (term = 2) vote to Candidate-0 (term = 2), when lastLogIndex < 0
+2019/11/11 10:08:54 [rf.loop] Candidate-0 (term = 2) convert Leader (votes = 2)
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 [rf.AppendEntries] Leader-2 (term = 1) set term = 2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 [broadcastAppendEntries] Leader-2 send to Follower-0, the log append term when sending is different from the leader currentTerm
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-2 send heartbeat to Follower-0
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-2
+2019/11/11 10:08:54 Leader-0 send heartbeat to Follower-1
+--- FAIL: TestReElection2A (1.53s)
+    config.go:282: Term 2 has 2 (>1) leaders
+FAIL
+exit status 1
+FAIL    raft    4.044s
+
+问题分析：Candidate-0 在term = 2时当选，且与 leader-2发送了AppendEntries, leader-2也
+确实转变了状态，并设置term = 2，但leader后续还在发送heartbeat的AppendEntries
