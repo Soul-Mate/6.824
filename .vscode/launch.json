@@ -16,5 +16,29 @@
                 "TestInitialElection2A",
             ],
         },
+
+        {
+            "name": "TestReElection2A",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/src/raft/",
+            "args": [
+                "-test.run",
+                "TestReElection2A",
+            ],
+        },
+
+        {
+            "name": "2A",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/src/raft/",
+            "args": [
+                "-test.run",
+                "2A",
+            ],
+        },
     ]
 }

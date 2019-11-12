@@ -69,31 +69,39 @@ func (rf *Raft) stateTransition(state State) {
 
 	switch state {
 	case Follower:
-		// 保存状态
+		// 可能有的状态转换:
+		//	Follower -> Follower
+		//		不需要特殊处理
+		//	Candidate -> Follower
+		//		说明其他Candidate当选, // TODO 清空投票信息?
+		// 	Leader -> Follower 
+		//		说明Leader term变小了，此时需要唤醒electionLoop
+
 		rf.state.store(state)
-
-		// 清空选票
-		rf.setVotes(-1)
-
+		rf.setVotes(-1) // 清空选票
+			
 		// Leader -> Follower
 		if prevState == Leader {
-			rf.leaderStepdownCh <- true
+			// 清空复制日志统计
+			rf.setReplicated(0)
+
+			DPrintf("[rf.stateTransition] Leader-%d convert Follower\n", rf.me)
+			rf.leaderBecomeFollwerCh <- true // 唤醒electionLoop
 		}
 
 	case Candidate:
-		// 保存状态
+		// 可能有的状态转换:
+		//	Follower -> Candidate
+		//		说明Follower选举计时器超时，开始选举
 		rf.state.store(state)
-		
-		// 清空选票
-		// rf.setVotes(-1)
+		// 不需要清空选票, Candidate在选举阶段会自动给自己投票，
+		// 将votes = 1
 
-	case Leader: // 状态转换为Leader
-		// 保存状态
+	case Leader: 
+		// 可能有的状态转换:
+		// 	Candidate -> Leader
+		//		说明Candidate当选，需要唤醒leaderLoop, 初始化[]nextIndex和[]matchIndex
 		rf.state.store(state)
-
-		// 清空选票
-		// rf.setVotes(-1)
-
 		// 初始化leader server上的nextIndex和matchIndex
 		rf.mu.Lock()
 		for index := range rf.peers {
@@ -105,7 +113,6 @@ func (rf *Raft) stateTransition(state State) {
 				// 实际上的日志末尾值为 len(rf.logs) - 1， 这里之所以不写为 len(rf.logs)，
 				// 是因为想用代码体现出字面表达的意思
 				rf.leaderState.nextIndex[index] = len(rf.logs) - 1 + 1
-
 				// matchIndex is used for safety. It is a conservative measurement of what prefix of the log the
 				// leader shares with a given follower. matchIndex cannot ever be set to a value that is too high, as
 				// this may cause the commitIndex to be moved too far forward. This is why matchIndex is initialized
@@ -116,7 +123,11 @@ func (rf *Raft) stateTransition(state State) {
 		}
 		rf.mu.Unlock()
 
-
+		if prevState == Candidate {
+			DPrintf("[rf.stateTransition] Candidate-%d (term = %d) convert Leader (get votes = %d)\n",
+						rf.me, rf.getCurrentTerm(), rf.getVotes())
+			rf.candidateBecomeLeaderCh <- true
+		}
 	}
 }
 
@@ -183,11 +194,16 @@ type Raft struct {
 	startHeartbeatCh       chan bool  // 开始发送心跳channel
 	commitCh               chan bool  // 提交日志channel
 
-	leaderStepdownCh chan bool
+	leaderStepdownCh   chan bool
 	leaderTookOfficeCh chan bool
+
+	candidateBecomeLeaderCh chan bool
+	leaderBecomeFollwerCh chan bool
 
 	state raftState
 	timer time.Timer
+
+	replicated uint32
 }
 
 func (rf *Raft) getCurrentTerm() (term int) {
@@ -202,13 +218,23 @@ func (rf *Raft) incrCurrentTerm() {
 	atomic.AddUint32(&rf.currentTerm, 1)
 }
 
+func (rf *Raft) incrReplicated() {
+	atomic.AddUint32(&rf.replicated, 1)
+}
+
+func (rf *Raft) getReplicated() (replicated int) {
+	return int(atomic.LoadUint32(&rf.replicated))
+}
+
+func (rf *Raft) setReplicated(replicated int) {
+	atomic.StoreUint32(&rf.replicated, uint32(replicated))
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-
-
 
 	term = rf.getCurrentTerm()
 
@@ -283,66 +309,59 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	// Check 1. Reply false if term < currentTerm (#5.1)
-	if args.Term < rf.getCurrentTerm() {
+	if rf.getCurrentTerm() <= args.Term {
+		// Rules for Servers
+		// All Servers:
+		//	If RPC request or respose contains term T > currentTerm:
+		//	set currentTerm = T, convert to follower (#5.1)
+		if rf.getCurrentTerm() < args.Term {
+			rf.setCurrentTerm(args.Term)
+			rf.stateTransition(Follower)
+			rf.setVotedFor(-1)
+		}
+		
+		// Check 2. If votedFor is null or candidatedId, and candidate's log is at
+		// 			least as up-to-date as receiver's log, grant vote (#5.2, #5.4)
+
+		if rf.getVotedFor() == -1 || args.CandidateID == rf.getVotedFor() {
+			rf.mu.Lock()
+			lastLogIndex := len(rf.logs) - 1
+			lastLogTerm := 0 
+			if lastLogIndex >= 0 {
+				lastLogTerm = rf.logs[lastLogIndex].Term
+				// rf.resetElectionTimeoutCh <- true
+				// rf.setVotedFor(args.CandidateID)
+				// rf.stateTransition(Follower)
+				// reply.Term = rf.getCurrentTerm()
+				// reply.VoteGranted = true
+				// DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d), when lastLogIndex < 0\n",
+				// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
+			}
+			rf.mu.Unlock()
+			
+			DPrintf("lastLogTerm = %d, args.LastLogTerm = %d\n", lastLogTerm, args.LastLogTerm)
+
+			if lastLogTerm < args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
+				rf.resetElectionTimeoutCh <- true
+				rf.stateTransition(Follower)
+				rf.setVotedFor(args.CandidateID)
+				reply.Term = rf.getCurrentTerm()
+				reply.VoteGranted = true
+				// DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d)\n",
+					// rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
+				return
+			}
+		}
+
+	} else {
+		// Your code here (2A, 2B).
+		// Check 1. Reply false if term < currentTerm (#5.1)
 		DPrintf("[rf.RequestVote]%s-%d (term = %d) refused to vote for Candidate-%d (term = %d)\n",
 			rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
-			
+		rf.setVotedFor(-1)
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
-		return
 	}
-	
-	// Rules for Servers
-	// All Servers:
-	//	If RPC request or respose contains term T > currentTerm:
-	//	set currentTerm = T, convert to follower (#5.1)
-	if args.Term > rf.getCurrentTerm() {
-		// DPrintf("[rf.RequestVote] %s-%d (term = %d) set term = %d\n", 
-		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(),  args.Term)
-		
-		rf.setCurrentTerm(args.Term)
-		rf.stateTransition(Follower)
-		rf.setVotedFor(-1)
-	}
-
-	// Check 2. If votedFor is null or candidatedId, and candidate's log is at
-	// 			least as up-to-date as receiver's log, grant vote (#5.2, #5.4)
-	if rf.getVotedFor() == -1 || args.CandidateID == rf.getVotedFor() {
-		rf.mu.Lock()
-		lastLogIndex := len(rf.logs) - 1
-		if lastLogIndex < 0 {
-			rf.mu.Unlock()
-			rf.resetElectionTimeoutCh <- true
-			rf.setVotedFor(args.CandidateID)
-			rf.stateTransition(Follower)
-			reply.Term = rf.getCurrentTerm()
-			reply.VoteGranted = true
-			DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d), when lastLogIndex < 0\n",
-				rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
-			
-			return
-		}
-
-		lastLogTerm := rf.logs[lastLogIndex].Term
-		rf.mu.Unlock()
-
-		if lastLogTerm < args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
-			rf.resetElectionTimeoutCh <- true
-			rf.stateTransition(Follower)
-			rf.setVotedFor(args.CandidateID)
-			reply.Term = rf.getCurrentTerm()
-			reply.VoteGranted = true
-			DPrintf("[rf.RequestVote] %s-%d (term = %d) vote to Candidate-%d (term = %d)\n",
-				rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.CandidateID, args.Term)
-			return
-		}
-	}
-
-	reply.Term = rf.getCurrentTerm()
-	reply.VoteGranted = false
-	return
 }
 
 //
@@ -445,98 +464,98 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Rules for Servers
-	
-	// Figure 2.
-	// AppendEntries RPC Receiver implementation
-	// Check 1. Reply false if term < currentTerm (# 5.1)
-	if args.Term < rf.getCurrentTerm() {
-		reply.Success = false
-		reply.Term = rf.getCurrentTerm()
-		// DPrintf("[rf.AppendEntries] %s-%d (term = %d) refused Leader-%d (term = %d) request\n", 
-		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
-		return
-	}
 
+	if rf.getCurrentTerm() <= args.Term {
+		// All Servers:
+		// 	If RPC request or response contains term T > currentTerm:
+		// 	set currentTerm = T, convert to follower (#5.1)
+		if rf.getCurrentTerm() < args.Term {
+			DPrintf("[rf.AppendEntries] %s-%d (term = %d) set term = %d\n",
+				rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.Term)
+			rf.setCurrentTerm(args.Term)
+			rf.stateTransition(Follower)
+		}
+		// TODO heartbeat
+		if len(args.Entries) == 0 && args.PrevLogIndex < 0 {
+			rf.resetElectionTimeoutCh <- true
+			rf.stateTransition(Follower)
+			// DPrintf("%s-%d (term = %d) receive Leader-%d (term = %d) heartbeat\n",
+			// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
 
-	// All Servers:
-	// 	If RPC request or response contains term T > currentTerm:
-	// 	set currentTerm = T, convert to follower (#5.1)
-	if args.Term > rf.getCurrentTerm() {
-		DPrintf("[rf.AppendEntries] %s-%d (term = %d) set term = %d\n", 
-			rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(),  args.Term)
-
-		rf.setCurrentTerm(args.Term)
-		rf.stateTransition(Follower)
-	}
-	
-	// TODO heartbeat
-	if len(args.Entries) == 0 && args.PrevLogIndex < 0 {
-		rf.resetElectionTimeoutCh <- true
-		rf.stateTransition(Follower)
-		// DPrintf("%s-%d (term = %d) receive Leader-%d (term = %d) heartbeat\n", 
-		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
-		
-		reply.Success = true
-		reply.Term = rf.getCurrentTerm()
-		return
-	}
-
-	// Check 2. Reply false if log doesn't contain an entry at prevLogIndex
-	// whose term matches prevLogTerm (# 5.3)
-	rf.mu.Lock()
-	if len(rf.logs) < args.PrevLogIndex {
-		rf.mu.Unlock()
-		reply.Success = false
-		reply.Term = rf.getCurrentTerm()
-		return
-	}
-	rf.mu.Unlock()
-
-	// Check 3. If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it (# 5.3)
-
-	// 要让follower的日志和自己一致，raft paper中对于日志复制这样描述：
-	// 	1.leader必须找到两者达成一致的最大的日志条目（索引最大）
-	// 	2. 删除follower日志中从那个点之后的所有日志
-	//	3. 将自己从那个点之后的所有日志条目复制给follower (在这里就是要复制这些日志)
-	rf.mu.Lock()
-	if args.PrevLogIndex >= 0  && len(rf.logs) >= args.PrevLogIndex && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm {
-		rf.resetElectionTimeoutCh <- true
-		rf.stateTransition(Follower)
-
-		// Check 4. Append any new entries not already in the log
-
-		// 删除follower日志中从那个点之后的所有日志
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
-
-		// 将自己从那个点之后的所有日志条目复制给follower (在这里就是要复制这些日志)
-		rf.logs = append(rf.logs, args.Entries...)
-
-		// Check 5. If leaderCommit > commitIndex, set commitIndex =
-		// min(leaderCommit, index of last new entry)
-		if args.LeaderCommit > rf.getCommitIndex() {
-			if args.LeaderCommit > len(rf.logs) {
-				rf.setCommitIndex(len(rf.logs))
-			} else {
-				rf.setCommitIndex(args.LeaderCommit)
-			}
+			reply.Success = true
+			reply.Term = rf.getCurrentTerm()
+			return
 		}
 
+		// Check 2. Reply false if log doesn't contain an entry at prevLogIndex
+		// whose term matches prevLogTerm (# 5.3)
+		rf.mu.Lock()
+		if len(rf.logs) < args.PrevLogIndex {
+			rf.mu.Unlock()
+			reply.Success = false
+			reply.Term = rf.getCurrentTerm()
+			return
+		}
 		rf.mu.Unlock()
 
-		rf.commitCh <- true
+		// Check 3. If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it (# 5.3)
 
-		// 接收者追加成功
-		DPrintf("Follower-%d exchange term %d -> %d\n", rf.me, rf.getCurrentTerm(), args.Term)
-		reply.Success = true
+		// 要让follower的日志和自己一致，raft paper中对于日志复制这样描述：
+		// 	1.leader必须找到两者达成一致的最大的日志条目（索引最大）
+		// 	2. 删除follower日志中从那个点之后的所有日志
+		//	3. 将自己从那个点之后的所有日志条目复制给follower (在这里就是要复制这些日志)
+		rf.mu.Lock()
+		if args.PrevLogIndex >= 0 {
+
+		
+		DPrintf("[rf.AppendEntires] args.PrevLogIndex = %d, len(rf.logs) = %d, rf.logs[args.PrevLogIndex].Term = %d, args.PrevLogTerm = %d\n", 
+			args.PrevLogIndex, len(rf.logs),  rf.logs[args.PrevLogIndex].Term, args.PrevLogTerm)
+		}
+		if args.PrevLogIndex >= 0 && len(rf.logs) >= args.PrevLogIndex && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm {
+			rf.resetElectionTimeoutCh <- true
+			rf.stateTransition(Follower)
+
+			DPrintf("[rf.AppendEntires] Follower-%d replica log...\n", rf.me)
+			// Check 4. Append any new entries not already in the log
+			// 删除follower日志中从那个点之后的所有日志
+			rf.logs = rf.logs[:args.PrevLogIndex+1]
+
+			// 将自己从那个点之后的所有日志条目复制给follower (在这里就是要复制这些日志)
+			rf.logs = append(rf.logs, args.Entries...)
+
+			// Check 5. If leaderCommit > commitIndex, set commitIndex =
+			// min(leaderCommit, index of last new entry)
+			if args.LeaderCommit > rf.getCommitIndex() {
+				if args.LeaderCommit > len(rf.logs) {
+					rf.setCommitIndex(len(rf.logs))
+				} else {
+					rf.setCommitIndex(args.LeaderCommit)
+				}
+			}
+
+			rf.mu.Unlock()
+
+			rf.commitCh <- true
+
+			// 接收者追加成功
+			DPrintf("Follower-%d exchange term %d -> %d\n", rf.me, rf.getCurrentTerm(), args.Term)
+			reply.Success = true
+			reply.Term = rf.getCurrentTerm()
+			return
+		}
+
+	} else {
+		// Figure 2.
+		// AppendEntries RPC Receiver implementation
+		// Check 1. Reply false if term < currentTerm (# 5.1)
+		reply.Success = false
 		reply.Term = rf.getCurrentTerm()
+		// DPrintf("[rf.AppendEntries] %s-%d (term = %d) refused Leader-%d (term = %d) request\n",
+		// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), args.LeaderId, args.Term)
 		return
 	}
-
-	reply.Success = false
-	reply.Term = rf.getCurrentTerm()
-	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -544,14 +563,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name string) {
+func (rf *Raft) broadcastAppendEntries(index int, term int, name string) {
 	if _, isLeader := rf.GetState(); !isLeader {
 		return
 	}
 
 	majority := len(rf.peers) / 2
 	majorityReplicaed := false
-
 	for peerIndex := range rf.peers {
 		// 自己不需要复制日志
 		if peerIndex == rf.me {
@@ -577,7 +595,6 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name 
 				// Leaders: If last log index >= nextIndex for a follower: send
 				// AppendEntries RPC with log entries starting at nextIndex
 				nextIndex := rf.leaderState.nextIndex[peer]
-
 				// leader的总体日志长度 >= 要发送给follower的下一个日志位置
 				// 复制nextIndex ~ index+1 的位置发送给follower
 				// 否则发送给follower一个空的entries
@@ -587,7 +604,7 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name 
 
 				// index of log entry immediately preceding new ones
 				prevLogIndex := nextIndex - 1
-				prevLogTerm := 0 
+				prevLogTerm := 0
 				if prevLogIndex >= 0 {
 					prevLogTerm = rf.logs[prevLogIndex].Term
 				}
@@ -608,14 +625,14 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name 
 
 				// 防止提交不同任期的日志
 				if rf.getCurrentTerm() != term {
-					DPrintf("[broadcastAppendEntries] Leader-%d send to Follower-%d, "+
+					DPrintf("[rf.broadcastAppendEntries] Leader-%d send to Follower-%d, "+
 						"the log append term when sending is different from the leader currentTerm \n", rf.me, peer)
 					return
 				}
 
-				DPrintf("%s-%d send %s to Follower-%d\n", 
-					rf.state.String(rf.state.load()), rf.me, name, peer)
-				
+				DPrintf("[rf.broadcastAppendEntries] %s-%d send to Follower-%d\n",
+					rf.state.String(rf.state.load()), rf.me, peer)
+
 				if rf.sendAppendEntries(peer, args, reply) {
 					// Rules for Servers:
 					// if RPC request or response contains term T > currentTerm:
@@ -640,9 +657,9 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name 
 						}
 
 						// follower成功复制日志，增加复制数量
-						replicaed++
+						rf.incrReplicated()
 
-						if majorityReplicaed != true && replicaed >= majority {
+						if majorityReplicaed != true && rf.getReplicated() >= majority {
 							majorityReplicaed = true
 						}
 
@@ -674,12 +691,11 @@ func (rf *Raft) broadcastAppendEntries(index int, term int, replicaed int, name 
 }
 
 func (rf *Raft) broadcastHeartbeat() {
-	if term, isLeader := rf.GetState(); isLeader {
+	if _, isLeader := rf.GetState(); isLeader {
 		rf.mu.Lock()
 		index := len(rf.logs) - 1
 		rf.mu.Unlock()
-		replicaed := 1
-		rf.broadcastAppendEntries(index, term, replicaed, "heartbeat")
+		rf.broadcastAppendEntries(index, rf.getCurrentTerm(), "heartbeat")
 	}
 
 	// leader 向其他服务器发送 heartbeat RPC
@@ -742,10 +758,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Unlock()
 
 		// 统计复制日志的服务器，自己也是其中之一
-		replicated := 1
-
-		// 发起日志复制时需要把当前任期的term传递
-		rf.broadcastAppendEntries(index, term, replicated, "replica log")
+		rf.incrReplicated()
+		// rf.mu.Lock()
+		// replicated := 1
+		// // 发起日志复制时需要把当前任期的term传递
+		// go rf.broadcastAppendEntries(index, term, replicated, "replica log")
+		// rf.mu.Unlock()
 	}
 
 	return index, term, isLeader
@@ -782,19 +800,15 @@ func (rf *Raft) startElection() {
 	rf.broadcastRequestVote()
 }
 
-// periodElectionTimeout 周期性的登台follower选举计时器超时
-func (rf *Raft) periodElectionTimeout() {
+// electionLoop 周期性的登台follower选举计时器超时
+func (rf *Raft) electionLoop() {
 	timer := time.NewTimer(randElectionMillisecond())
 L:
 	for {
 		// 在peer是leeader的情况下，不需要选举计时器
 		// 进入condition等待，直到leader退任
 		if _, isLeader := rf.GetState(); isLeader {
-			<-rf.leaderStepdownCh
-
-			// rf.mu.Lock()
-			// rf.leaderStepDownCond.Wait()
-			// rf.mu.Unlock()
+			<-rf.leaderBecomeFollwerCh
 		} else {
 			// 在peer不是leader的情况下
 			// 等待心跳、投票事件，重置选举计时器
@@ -805,11 +819,80 @@ L:
 					goto L
 				}
 
+		
+
 				// 开始选举
-				rf.startElectionCh <- true
+				rf.stateTransition(Candidate)
+
+				// Increment currentTerm
+				rf.incrCurrentTerm()
+
+				// Vote for self
+				rf.setVotes(1)
+
+				// Reset election timer
+				timer.Reset(randElectionMillisecond())
+
+				// Send RequestVote RPCs to all other servers
+				rf.broadcastRequestVote()
+
+				DPrintf("[rf.electionLoop] %s-%d election timeout, start election... (term = %d)\n",
+					rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
+				
+				for {
+					if rf.state.load() != Candidate {
+						break
+					}
+
+					select {
+					case <- timer.C:
+							// Increment currentTerm
+						rf.incrCurrentTerm()
+
+						// Vote for self
+						rf.setVotes(1)
+
+						// Reset election timer
+						timer.Reset(randElectionMillisecond())
+
+						// Send RequestVote RPCs to all other servers
+						rf.broadcastRequestVote()
+		
+						// DPrintf("[rf.electionLoop] %s-%d election timeout, relection (term = %d)\n",
+						// 	rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
+	
+					default:
+						if rf.getVotes() > len(rf.peers) / 2 {
+							
+							rf.stateTransition(Leader)
+						}
+					}
+				}
+
 			case <-rf.resetElectionTimeoutCh: // 收到了leader发送的AppendEntries 或 Candidate投票请求，重置选举计时器
 				timer.Reset(randElectionMillisecond())
 			}
+		}
+	}
+}
+
+func (rf *Raft) leaderLoop() {
+	timer := time.NewTimer(randBroadcastMillisecond())
+L:
+	for {
+		if _, isLeader := rf.GetState(); !isLeader {
+			<-rf.candidateBecomeLeaderCh
+		} else {
+			<-timer.C
+			// 在定时器到期过程中不在是leader了
+			// 那么后续则不在处理了
+			if _, isLeader := rf.GetState(); !isLeader {
+				goto L
+			}
+
+			rf.broadcastHeartbeat()
+
+			timer.Reset(randBroadcastMillisecond())
 		}
 	}
 }
@@ -829,6 +912,7 @@ func (rf *Raft) periodHeartbeat() {
 		} else {
 			select {
 			case <-timer.C:
+				<-timer.C
 				rf.startHeartbeatCh <- true
 				timer.Reset(randBroadcastMillisecond())
 			}
@@ -878,9 +962,9 @@ L:
 			}
 
 		case Candidate:
-			DPrintf("[rf.loop] %s-%d election timeout, start election... (term = %d)\n", 
+			DPrintf("[rf.loop] %s-%d election timeout, start election... (term = %d)\n",
 				rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
-			
+
 			// 开始选举
 			rf.startElection()
 
@@ -888,20 +972,20 @@ L:
 				if rf.state.load() != Candidate {
 					break
 				}
-				
-				select{
-				case <- rf.startElectionCh:
+
+				select {
+				case <-rf.startElectionCh:
 					rf.startElection()
 
 				default:
 					if rf.getVotes() > len(rf.peers)/2 {
 
-						DPrintf("[rf.loop] %s-%d (term = %d) convert Leader (votes = %d)\n", 
+						DPrintf("[rf.loop] %s-%d (term = %d) convert Leader (votes = %d)\n",
 							rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm(), rf.getVotes())
-						
+
 						// 转换为leader
 						rf.stateTransition(Leader)
-						
+
 						goto L
 						// 立即发送心跳信息，防止选举超时
 						// rf.broadcastHeartbeat()
@@ -923,48 +1007,47 @@ L:
 		}
 	}
 
+	// L:
+	// 	for {
+	// 		select {
+	// 		case <-rf.startElectionCh: // 收到选举channel
+	// 			DPrintf("%s-%d start election\n", rf.state.String(rf.state.load()), rf.me)
 
-// L:
-// 	for {
-// 		select {
-// 		case <-rf.startElectionCh: // 收到选举channel
-// 			DPrintf("%s-%d start election\n", rf.state.String(rf.state.load()), rf.me)
+	// 			// 转变状态
+	// 			rf.stateTransition(Candidate)
 
-// 			// 转变状态
-// 			rf.stateTransition(Candidate)
+	// 			// 开始选举
+	// 			rf.startElection()
 
-// 			// 开始选举
-// 			rf.startElection()
+	// 			// 等待选举结果或选举超时重新开始新一轮的选举
+	// 			for {
+	// 				if rf.state.load() != Candidate {
+	// 					break
+	// 				}
 
-// 			// 等待选举结果或选举超时重新开始新一轮的选举
-// 			for {
-// 				if rf.state.load() != Candidate {
-// 					break
-// 				}
+	// 				select {
+	// 				case <-rf.startElectionCh: // 选举超时
+	// 					// 开始新一轮选举
+	// 					rf.startElection()
+	// 				default:
+	// 					if rf.getVotes() > len(rf.peers)/2 {
+	// 						DPrintf("Candidate-%d (term = %d) -> Leader get votes = %d\n", rf.me, rf.getCurrentTerm(), rf.getVotes())
+	// 						// 转换为leader
+	// 						rf.stateTransition(Leader)
 
-// 				select {
-// 				case <-rf.startElectionCh: // 选举超时
-// 					// 开始新一轮选举
-// 					rf.startElection()
-// 				default:
-// 					if rf.getVotes() > len(rf.peers)/2 {
-// 						DPrintf("Candidate-%d (term = %d) -> Leader get votes = %d\n", rf.me, rf.getCurrentTerm(), rf.getVotes())
-// 						// 转换为leader
-// 						rf.stateTransition(Leader)
-						
-// 						// 立即发送心跳信息，防止选举超时
-// 						// rf.broadcastHeartbeat()
+	// 						// 立即发送心跳信息，防止选举超时
+	// 						// rf.broadcastHeartbeat()
 
-// 						goto L
-// 					}
-// 				}
-// 			}
-// 		case <-rf.startHeartbeatCh: // 收到心跳发送channel
-// 			DPrintf("[rf.loop] %s-%d (term = %d) broadcast heartbeat\n", rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
-			
-// 			rf.broadcastHeartbeat()
-// 		}
-// 	}
+	// 						goto L
+	// 					}
+	// 				}
+	// 			}
+	// 		case <-rf.startHeartbeatCh: // 收到心跳发送channel
+	// 			DPrintf("[rf.loop] %s-%d (term = %d) broadcast heartbeat\n", rf.state.String(rf.state.load()), rf.me, rf.getCurrentTerm())
+
+	// 			rf.broadcastHeartbeat()
+	// 		}
+	// 	}
 	// 	rf.timer = newRaftTimer()
 	// L:
 	// 	for {
@@ -1084,18 +1167,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leaderStepdownCh = make(chan bool)
 	rf.leaderTookOfficeCh = make(chan bool)
 
+	rf.leaderBecomeFollwerCh = make(chan bool)
+	rf.candidateBecomeLeaderCh = make(chan bool)
+
 	rf.commitCh = make(chan bool)
+
+	atomic.StoreUint32(&rf.replicated, 0)
 
 	rf.state = newRaftState()
 	rf.state.store(Follower)
-
+	
 	// 启动 raft 事件主循环
-	go rf.loop()
+	// go rf.loop()
+
+	go rf.electionLoop()
+
+	go rf.leaderLoop()
 
 	// 启动 raft 提交日志循环
 	go rf.commit()
 
-	go rf.periodElectionTimeout()
+	// go rf.electionLoop()
 
 	// go rf.periodHeartbeat()
 
@@ -1104,4 +1196,3 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
-
